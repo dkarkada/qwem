@@ -14,10 +14,10 @@ import os
 
 from ExptTrace import ExptTrace
 from FileManager import FileManager
-from misc import Logger, rcsetup
+from misc import rcsetup
 rcsetup()
+
 import utils
-from plotting import make_progress_plot
 
 
 def get_loss_fn(hypers, min_loss):
@@ -59,7 +59,7 @@ def get_batch_generator(hypers, data_fm, q_pos, q_neg):
     chunk_narticles = hypers.chunk_narticles
     
     article_idxs = data_fm.load("article_arr_idxs.npy")
-    corpus_fn = data_fm.get_filename("enwiki.bin")
+    corpus_fn = data_fm.get_filename("corpus.bin")
     chunk = None
     cur_article_idx = 0
     min_article_len = 500
@@ -76,7 +76,8 @@ def get_batch_generator(hypers, data_fm, q_pos, q_neg):
 
         def load_one(idx):
             start, stop = article_idxs[idx], article_idxs[idx+1] - 1
-            return np.array(corpus[start:stop], dtype=dtype)
+            article = np.array(corpus[start:stop], dtype=dtype)
+            return article[article < vocab_sz]
 
         with ThreadPoolExecutor(max_workers=n_threads) as executor:
             chunk = list(executor.map(load_one, idxs))
@@ -91,12 +92,8 @@ def get_batch_generator(hypers, data_fm, q_pos, q_neg):
         jstart = 1 + np.random.randint(jstep)
         for i in range(istart, len(article) - (context_len+1), istep):
             w = article[i]
-            if w >= vocab_sz:
-                continue
             for j in range(jstart, context_len+1, jstep):
                 v = article[i+j]
-                if v >= vocab_sz:
-                    continue
                 targets[idx] = w
                 pos_probes[idx] = v
                 pos_weights[idx] = context_len+1-j
@@ -111,8 +108,6 @@ def get_batch_generator(hypers, data_fm, q_pos, q_neg):
         istart = np.random.randint(istep)
         for i in range(istart, len(article), istep):
             w = article[i]
-            if w >= vocab_sz:
-                continue
             neg_probes[idx] = w
             idx += 1
             if idx >= len(neg_probes):
@@ -137,7 +132,7 @@ def get_batch_generator(hypers, data_fm, q_pos, q_neg):
             article = chunk[np.random.randint(chunk_narticles)]
             fill_idx = negative_samples(article, fill_idx, neg_probes)
         neg_probes = np.random.permutation(neg_probes)
-        neg_weights = q_neg(targets, neg_probes)
+        neg_weights = hypers.ns_weight * q_neg(targets, neg_probes)
         
         batch = [targets, pos_probes, pos_weights, neg_probes, neg_weights]
         batch = [jax.device_put(x) for x in batch]
@@ -165,7 +160,6 @@ def train_embeddings(hypers):
     H = hypers
     fm = FileManager(H.expt_dir)
     H.save(fm.get_filename("hypers.json"))
-    logger = Logger(fm.get_filename("expt.out"))
     if H.checkpt_intervals:
         savetimes = np.concatenate([
             np.linspace(start, end, num, endpoint=(i==len(H.checkpt_intervals)-1))
@@ -184,7 +178,7 @@ def train_embeddings(hypers):
     if analogy_dict is None:
         raise FileNotFoundError("Analogy file not found.")
 
-    data_fm.set_filepath("min500")
+    data_fm.set_filepath(H.dataset)
     word_counts = data_fm.load("word_counts.pickle")
     if len(word_counts) < H.vocab_sz:
         raise ValueError(f'Vocab sz {H.vocab_sz} too large. Max = {len(word_counts)}')
@@ -213,15 +207,15 @@ def train_embeddings(hypers):
         print("done.")
 
         print(f"Computing q_pos and q_neg... ", end="", flush=True)
-        PiPj = np.outer(unigram, unigram)
+        PiPj = H.ns_weight*np.outer(unigram, unigram)
         Gij = Pij + PiPj
         
-        if hypers.loss == "qwem":
+        if H.loss == "qwem":
             Mstar = 2*(Pij - PiPj)/(Pij + PiPj)
-        elif hypers.loss == "sgns":
+        elif H.loss == "sgns":
             Mstar = np.log((Pij / PiPj) + np.exp(-5))
         else:
-            raise ValueError(f"{hypers.loss} is not a supported loss function")
+            raise ValueError(f"{H.loss} is not a supported loss function")
         distr = (Gij / Gij.mean())**(-1)
         q_pos = lambda i,j: distr[i, j]
         q_neg = q_pos
@@ -233,8 +227,8 @@ def train_embeddings(hypers):
         q_pos = lambda i,j: accept[i]*accept[j]
         neg_distr = unigram**.75 / unigram
         neg_distr /= neg_distr.mean()
-        q_neg = lambda i,j: .5*(accept[i]*neg_distr[j] + accept[j]*neg_distr[i])
-        min_loss = -0.12
+        q_neg = lambda i,j: 0.5*(accept[i]*neg_distr[j] + accept[j]*neg_distr[i])
+        min_loss = -0.12 # hacky guess lol
     else:
         raise ValueError(f"{H.reweight} is not a supported reweighting scheme")
     
@@ -264,7 +258,7 @@ def train_embeddings(hypers):
     nsteps = 0
     loss_buffer = []
     et_loss, et_acc, et_sv = ExptTrace.multi_init(3, ["nstep"])
-    logger.print("Starting training loop.")
+    print("Starting training loop.")
     while nsteps <= H.maxsteps:
         batch = next(batch_gen)
         loss = train_step(model, optimizer, batch)
@@ -276,11 +270,15 @@ def train_embeddings(hypers):
             weight = model.embedding.value
             acc = analogy_dataset.eval_accuracy(np.asarray(weight))
             et_acc[nsteps] = acc
-            et_sv[nsteps] = np.asarray(jnp.linalg.svdvals(weight))
+            et_sv[nsteps] = np.asarray(jnp.linalg.svdvals(weight[:10_000]))
             results = [x.serialize() for x in [et_loss, et_acc, et_sv]]
             fm.save(results, "results.pickle")
-            logger.print(f"t={nsteps//1000:03d}k: loss={et_loss[:][-100:].mean():.7f}, acc={acc*100:.2f}%")
-            make_progress_plot([et_loss, et_acc, et_sv], fm, title=f"acc {acc*100:.2f}%")
+            if nsteps > 0:
+                print(f"t={nsteps//1000:03d}k:", end=" ")
+                print(f"loss={et_loss[:][-100:].mean():.7f}", end=" ")
+                print(f"acc={acc*100:.2f}%")
+                utils.make_progress_plot([et_loss, et_acc, et_sv], fm,
+                                         title=f"acc {acc*100:.2f}%")
         
         if H.checkpt_intervals and (nsteps in savetimes):
             weight = np.asarray(model.embedding.value)

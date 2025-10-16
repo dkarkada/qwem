@@ -1,0 +1,10 @@
+.venv*
+__pycache__
+deprecated/
+scratch.txt
+notebooks/benchmarks
+word2vec_tied/compute-accuracy
+word2vec_tied/word2vec
+word2vec_tied/vectors.bin
+notebooks/figures
+data/prepare_enwiki.py
